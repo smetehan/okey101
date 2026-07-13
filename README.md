@@ -44,3 +44,4 @@ Taşlar **tarayıcıda değil, sunucuda** (Next.js API route) karıştırılır 
 - **Okey çalma / gösterge okeyi bonusu** gibi bölgesel varyantlar yok — istenirse eklenir.
 - Elden bitme bonusu (−101) sabitlerde tanımlı ama otomatik uygulanmıyor (bölgesel kural farkları netleşince bağlanır).
 - Test: `npm run test:engine` → 32 birim testi (taş dağıtımı, per/seri/küt/çift, açma, ceza).
+# okey101
