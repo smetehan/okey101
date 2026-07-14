@@ -15,75 +15,198 @@ export async function POST(req: NextRequest, ctx: Ctx) {
   const db = supabaseAdmin();
   const body = await req.json().catch(() => ({}));
 
-  // Durumları oku (tek masa: id=1)
-  const [{ data: pub }, { data: prv }] = await Promise.all([
-    db.from("game_public").select("*").eq("id", 1).single(),
-    db.from("game_private").select("*").eq("id", 1).single(),
+  // ── Durumları oku; satırlar silinmişse KENDİNİ ONAR ────
+  let [{ data: pub }, { data: prv }] = await Promise.all([
+    db.from("game_public").select("*").eq("id", 1).maybeSingle(),
+    db.from("game_private").select("*").eq("id", 1).maybeSingle(),
   ]);
-  if (!pub || !prv) return hata("Masa bulunamadı — schema.sql çalıştırıldı mı?", 500);
+  if (!pub) {
+    await db.from("game_public").upsert({ id: 1 });
+    ({ data: pub } = await db.from("game_public").select("*").eq("id", 1).single());
+  }
+  if (!prv) {
+    await db.from("game_private").upsert({ id: 1 });
+    ({ data: prv } = await db.from("game_private").select("*").eq("id", 1).single());
+  }
+  if (!pub || !prv) return hata("Masa oluşturulamadı — schema.sql çalıştırıldı mı?", 500);
+
+  const oyuncular: { koltuk: number; ad: string }[] = pub.oyuncular ?? [];
+  const tokenlar: Record<string, string> = prv.tokenlar ?? {};
+  const bekleyenler: { istekId: string; ad: string }[] = pub.bekleyenler ?? [];
+  const bekleyenTokenlar: Record<string, string> = prv.bekleyen_tokenlar ?? {};
 
   // ── GİRİŞ ──────────────────────────────────────────────
   if (action === "giris") {
     const { ad, sifre } = body as { ad?: string; sifre?: string };
     if (!ad?.trim()) return hata("Kullanıcı adı gerekli");
-    if (sifre !== process.env.MASA_SIFRESI) return hata("Şifre yanlış", 401);
-
     const adT = ad.trim().slice(0, 16);
-    const oyuncular: { koltuk: number; ad: string }[] = pub.oyuncular ?? [];
-    const tokenlar: Record<string, string> = prv.tokenlar ?? {};
 
-    // Aynı adla dönen oyuncu → koltuğunu geri ver (yeniden bağlanma)
-    let koltuk = oyuncular.find((o) => o.ad === adT)?.koltuk ?? -1;
-    if (koltuk === -1) {
-      const dolu = new Set(oyuncular.map((o) => o.koltuk));
-      koltuk = [0, 1, 2, 3].find((k) => !dolu.has(k)) ?? -1;
-      if (koltuk === -1) return hata("Masa dolu (4/4)", 409);
-      oyuncular.push({ koltuk, ad: adT });
-    }
+    const adminMi = !!process.env.ADMIN_SIFRESI && sifre === process.env.ADMIN_SIFRESI;
+    if (!adminMi && sifre !== process.env.MASA_SIFRESI) return hata("Şifre yanlış", 401);
+
     const token = globalThis.crypto.randomUUID();
-    tokenlar[String(koltuk)] = token;
 
+    // Yeniden bağlanma: adı zaten koltukta olan token'ını yeniler
+    const mevcut = oyuncular.find((o) => o.ad === adT);
+    if (mevcut) {
+      tokenlar[String(mevcut.koltuk)] = token;
+      const guncel: Record<string, unknown> = { tokenlar };
+      if (adminMi) guncel.admin_token = token;
+      await db.from("game_private").update(guncel).eq("id", 1);
+      return NextResponse.json({ ok: true, token, koltuk: mevcut.koltuk, ad: adT, admin: adminMi });
+    }
+
+    // Admin: onaysız, masa kapalı olsa bile oturur
+    if (adminMi) {
+      const dolu = new Set(oyuncular.map((o) => o.koltuk));
+      const koltuk = [0, 1, 2, 3].find((k) => !dolu.has(k));
+      if (koltuk === undefined) return hata("Masa dolu (4/4)", 409);
+      oyuncular.push({ koltuk, ad: adT });
+      tokenlar[String(koltuk)] = token;
+      await Promise.all([
+        db.from("game_public").update({ oyuncular }).eq("id", 1),
+        db.from("game_private").update({ tokenlar, admin_token: token }).eq("id", 1),
+      ]);
+      return NextResponse.json({ ok: true, token, koltuk, ad: adT, admin: true });
+    }
+
+    // Normal oyuncu: masa açık olmalı, admin onayına düşer
+    if (!pub.masa_acik) return hata("Masa şu an kapalı — adminin masayı açması gerekiyor", 403);
+    const istekId = globalThis.crypto.randomUUID();
+    const eski = bekleyenler.find((b) => b.ad === adT);
+    if (eski) {
+      delete bekleyenTokenlar[eski.istekId];
+      eski.istekId = istekId;
+    } else {
+      bekleyenler.push({ istekId, ad: adT });
+    }
+    bekleyenTokenlar[istekId] = token;
     await Promise.all([
-      db.from("game_public").update({ oyuncular }).eq("id", 1),
-      db.from("game_private").update({ tokenlar }).eq("id", 1),
+      db.from("game_public").update({ bekleyenler }).eq("id", 1),
+      db.from("game_private").update({ bekleyen_tokenlar: bekleyenTokenlar }).eq("id", 1),
     ]);
-    return NextResponse.json({ ok: true, token, koltuk, ad: adT });
+    return NextResponse.json({ ok: true, beklemede: true, token, ad: adT });
   }
 
-  // ── Diğer tüm aksiyonlar token ister ───────────────────
+  // ── Token çözümle ──────────────────────────────────────
   const token = req.headers.get("x-oyuncu-token") ?? body.token;
-  const koltukStr = Object.entries(prv.tokenlar ?? {}).find(([, t]) => t === token)?.[0];
+
+  // ── BEKLE: onay bekleyen oyuncu durumunu sorar ─────────
+  if (action === "bekle") {
+    const koltukStr = Object.entries(tokenlar).find(([, t]) => t === token)?.[0];
+    if (koltukStr !== undefined)
+      return NextResponse.json({ ok: true, koltuk: Number(koltukStr) });
+    const istekId = Object.entries(bekleyenTokenlar).find(([, t]) => t === token)?.[0];
+    if (istekId && bekleyenler.some((b) => b.istekId === istekId))
+      return NextResponse.json({ ok: true, beklemede: true });
+    return hata("İstek reddedildi veya bulunamadı", 410);
+  }
+
+  const koltukStr = Object.entries(tokenlar).find(([, t]) => t === token)?.[0];
   if (koltukStr === undefined) return hata("Oturum geçersiz — tekrar giriş yapın", 401);
   const koltuk = Number(koltukStr);
+  const adminMi = !!token && token === prv.admin_token;
 
-  const eller: Tas[][] = prv.eller;
-  const yigin: Tas[] = prv.yigin;
+  const eller: Tas[][] = prv.eller ?? [[], [], [], []];
+  const yigin: Tas[] = prv.yigin ?? [];
   const okey: OkeyBilgi | null = pub.okey;
   const olay = (tip: string, mesaj: string) => ({ tip, koltuk, mesaj, ts: Date.now() });
 
   // ── DURUM: kendi elini getir ───────────────────────────
   if (action === "durum") {
-    return NextResponse.json({ ok: true, koltuk, el: eller[koltuk] ?? [] });
+    return NextResponse.json({ ok: true, koltuk, el: eller[koltuk] ?? [], admin: adminMi });
   }
 
-  // ── SIFIRLA: masayı tamamen sıfırla (herkes lobiye) ────
+  // ═══════════ ADMİN AKSİYONLARI ═══════════
+  if (["masa", "kabul", "reddet", "yenioyun", "sifirla", "ayar", "basla"].includes(action) && !adminMi)
+    return hata("Bu işlem için admin yetkisi gerekir", 403);
+
+  // ── MASA: aç / kapat ──
+  if (action === "masa") {
+    const acik = !!body.acik;
+    const guncelPub: Record<string, unknown> = {
+      masa_acik: acik,
+      son_olay: olay("masa", acik ? "Masa açıldı" : "Masa kapatıldı"),
+    };
+    if (!acik) guncelPub.bekleyenler = []; // kapanınca kuyruk boşalır
+    await Promise.all([
+      db.from("game_public").update(guncelPub).eq("id", 1),
+      acik ? Promise.resolve() : db.from("game_private").update({ bekleyen_tokenlar: {} }).eq("id", 1),
+    ]);
+    return NextResponse.json({ ok: true });
+  }
+
+  // ── KABUL: bekleyen oyuncuyu koltuğa oturt ──
+  if (action === "kabul") {
+    const { istekId } = body as { istekId: string };
+    const idx = bekleyenler.findIndex((b) => b.istekId === istekId);
+    if (idx === -1) return hata("İstek bulunamadı");
+    const dolu = new Set(oyuncular.map((o) => o.koltuk));
+    const yeniKoltuk = [0, 1, 2, 3].find((k) => !dolu.has(k));
+    if (yeniKoltuk === undefined) return hata("Masa dolu (4/4)");
+    const [istek] = bekleyenler.splice(idx, 1);
+    oyuncular.push({ koltuk: yeniKoltuk, ad: istek.ad });
+    tokenlar[String(yeniKoltuk)] = bekleyenTokenlar[istekId];
+    delete bekleyenTokenlar[istekId];
+    await Promise.all([
+      db.from("game_public").update({
+        oyuncular, bekleyenler,
+        son_olay: olay("kabul", `${istek.ad} masaya kabul edildi`),
+      }).eq("id", 1),
+      db.from("game_private").update({ tokenlar, bekleyen_tokenlar: bekleyenTokenlar }).eq("id", 1),
+    ]);
+    return NextResponse.json({ ok: true });
+  }
+
+  // ── REDDET ──
+  if (action === "reddet") {
+    const { istekId } = body as { istekId: string };
+    const idx = bekleyenler.findIndex((b) => b.istekId === istekId);
+    if (idx === -1) return hata("İstek bulunamadı");
+    bekleyenler.splice(idx, 1);
+    delete bekleyenTokenlar[istekId];
+    await Promise.all([
+      db.from("game_public").update({ bekleyenler }).eq("id", 1),
+      db.from("game_private").update({ bekleyen_tokenlar: bekleyenTokenlar }).eq("id", 1),
+    ]);
+    return NextResponse.json({ ok: true });
+  }
+
+  // ── YENİ OYUN: skorlar/eller sıfırlanır, oyuncular kalır ──
+  if (action === "yenioyun") {
+    await Promise.all([
+      db.from("game_public").update({
+        faz: "lobi", sira: null, cekti: false, gosterge: null, okey: null,
+        yigin_sayisi: 0, el_sayilari: [0, 0, 0, 0], atilanlar: [[], [], [], []],
+        acilan_perler: [], acanlar: [false, false, false, false],
+        skorlar: [0, 0, 0, 0], el_no: 0,
+        son_olay: olay("yenioyun", "Yeni oyun başlatıldı — skorlar sıfırlandı"),
+      }).eq("id", 1),
+      db.from("game_private").update({ yigin: [], eller: [[], [], [], []] }).eq("id", 1),
+    ]);
+    return NextResponse.json({ ok: true });
+  }
+
+  // ── SIFIRLA: masa tamamen boşalır (herkes çıkar) ──
   if (action === "sifirla") {
     await Promise.all([
       db.from("game_public").update({
         faz: "lobi", sira: null, cekti: false, gosterge: null, okey: null,
         yigin_sayisi: 0, el_sayilari: [0, 0, 0, 0], atilanlar: [[], [], [], []],
         acilan_perler: [], acanlar: [false, false, false, false],
-        skorlar: [0, 0, 0, 0], el_no: 0, oyuncular: [],
-        son_olay: olay("sifirla", "Masa sıfırlandı"),
+        skorlar: [0, 0, 0, 0], el_no: 0, oyuncular: [], bekleyenler: [],
+        masa_acik: false,
+        son_olay: { tip: "sifirla", koltuk: -1, mesaj: "Masa sıfırlandı", ts: Date.now() },
       }).eq("id", 1),
       db.from("game_private").update({
         yigin: [], eller: [[], [], [], []], tokenlar: {},
+        bekleyen_tokenlar: {}, admin_token: null,
       }).eq("id", 1),
     ]);
     return NextResponse.json({ ok: true });
   }
 
-  // ── AYAR: eşli/tekli ve katlamalı (sadece el sürerken değil) ──
+  // ── AYAR: eşli/tekli ve katlamalı ──
   if (action === "ayar") {
     if (pub.faz === "oyun") return hata("El sürerken ayar değiştirilemez");
     const mod = body.mod === "esli" ? "esli" : "tekli";
@@ -95,21 +218,20 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: true });
   }
 
-  // ── BAŞLA: yeni el dağıt ───────────────────────────────
+  // ── BAŞLA: yeni el dağıt ──
   if (action === "basla") {
-    if ((pub.oyuncular ?? []).length < 4) return hata("4 oyuncu gerekli");
+    if (oyuncular.length < 4) return hata("4 oyuncu gerekli");
     if (pub.faz === "oyun") return hata("El zaten devam ediyor");
 
-    // İlk eli rastgele oyuncu, sonrakileri sırayla bir sonraki başlatır
     const baslayan =
       pub.el_no === 0
-        ? Number((globalThis.crypto.getRandomValues(new Uint32Array(1))[0]) % 4)
+        ? Number(globalThis.crypto.getRandomValues(new Uint32Array(1))[0] % 4)
         : ((pub.baslayan ?? 0) + 1) % 4;
 
     const d = dagit(baslayan);
     await Promise.all([
       db.from("game_public").update({
-        faz: "oyun", sira: baslayan, cekti: true, // başlayan 22 taşla başlar, çekmiş sayılır
+        faz: "oyun", sira: baslayan, cekti: true,
         baslayan, gosterge: d.gosterge, okey: d.okey,
         yigin_sayisi: d.yigin.length,
         el_sayilari: d.eller.map((e) => e.length),
@@ -123,12 +245,12 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: true });
   }
 
-  // Bundan sonrası aktif el ve sıra kontrolü ister
+  // ═══════════ OYUN AKSİYONLARI ═══════════
   if (pub.faz !== "oyun" || !okey) return hata("Aktif el yok");
   if (pub.sira !== koltuk) return hata("Sıra sizde değil");
   const el = eller[koltuk];
 
-  // ── ÇEK: yığından veya önceki oyuncunun attığından ─────
+  // ── ÇEK ──
   if (action === "cek") {
     if (pub.cekti) return hata("Bu tur zaten taş çektiniz");
     const kaynak = body.kaynak as "yigin" | "atilan";
@@ -138,7 +260,6 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     if (kaynak === "yigin") {
       tas = yigin.pop();
       if (!tas) {
-        // Yığın bitti → el berabere kapanır
         await db.from("game_public").update({
           faz: "el_sonu",
           son_olay: olay("berabere", "Yığın bitti — el berabere"),
@@ -163,13 +284,12 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: true, tas });
   }
 
-  // ── AÇ: per(ler) indir — ilk açılışta 101 / 4 çift şartı ─
+  // ── AÇ ──
   if (action === "ac") {
     if (!pub.cekti) return hata("Önce taş çekmelisiniz");
     const grupIdler = body.gruplar as number[][];
     if (!Array.isArray(grupIdler) || grupIdler.length === 0) return hata("Grup seçilmedi");
 
-    // id'leri elden taşlara çevir (her taş yalnızca bir grupta olabilir)
     const kullanildi = new Set<number>();
     const gruplar: Tas[][] = [];
     for (const idler of grupIdler) {
@@ -188,13 +308,11 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const acilan: { koltuk: number; taslar: Tas[]; tip: string }[] = pub.acilan_perler;
 
     if (!acanlar[koltuk]) {
-      // İLK açılış: 101 puan veya en az 4 çift
       const s = acmaKontrol(gruplar, okey);
       if (!s.gecerli) return hata(s.hata ?? "Açılamaz");
       for (const g of gruplar) acilan.push({ koltuk, taslar: g, tip: s.tip! });
       acanlar[koltuk] = true;
     } else {
-      // Sonraki turlar: her grup tek başına geçerli per/çift olmalı
       for (const g of gruplar) {
         const p = perKontrol(g, okey);
         const c = ciftMi(g, okey);
@@ -216,7 +334,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: true });
   }
 
-  // ── İŞLE: masadaki bir pere taş ekle (açmış oyuncu) ────
+  // ── İŞLE ──
   if (action === "isle") {
     if (!pub.cekti) return hata("Önce taş çekmelisiniz");
     if (!pub.acanlar[koltuk]) return hata("İşlemek için önce açmalısınız");
@@ -246,7 +364,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: true });
   }
 
-  // ── AT: taş at, sıra geçer — el 0'a inerse el biter ────
+  // ── AT ──
   if (action === "at") {
     if (!pub.cekti) return hata("Önce taş çekmelisiniz");
     const tasId = body.tasId as number;
@@ -267,8 +385,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       const ciftActi = (pub.acilan_perler as { koltuk: number; tip: string }[])
         .some((p) => p.koltuk === koltuk && p.tip === "cift");
       let carpan = okeyleBitti ? SABITLER.OKEY_ATARAK_BITME_CARPAN : 1;
-      if (pub.katlamali && ciftActi) carpan *= 2; // katlamalı: çiftten giden el ×2
-      const esli = pub.mod === "esli"; // takımlar: koltuk 0-2 ve 1-3
+      if (pub.katlamali && ciftActi) carpan *= 2;
+      const esli = pub.mod === "esli";
 
       const skorlar: number[] = [...pub.skorlar];
       for (let k = 0; k < 4; k++) {
@@ -284,8 +402,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         db.from("game_public").update({
           faz: "el_sonu", atilanlar, skorlar,
           el_sayilari: eller.map((e) => e.length),
-          son_olay: olay("bitti",
-            `Eli bitirdi${notlar ? ` (${notlar}, ×${carpan})` : ""}`),
+          son_olay: olay("bitti", `Eli bitirdi${notlar ? ` (${notlar}, ×${carpan})` : ""}`),
         }).eq("id", 1),
         db.from("game_private").update({ eller }).eq("id", 1),
       ]);

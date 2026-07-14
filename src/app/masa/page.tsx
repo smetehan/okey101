@@ -27,6 +27,8 @@ interface PubState {
   el_no: number;
   mod: "tekli" | "esli";
   katlamali: boolean;
+  masa_acik: boolean;
+  bekleyenler: { istekId: string; ad: string }[];
   son_olay: { tip: string; koltuk: number; mesaj: string; ts: number } | null;
   updated_at: string;
 }
@@ -101,6 +103,7 @@ export default function MasaPage() {
   const [mikrofon, setMikrofon] = useState(true);
   const [konusanlar, setKonusanlar] = useState<Set<number>>(new Set());
   const [tamEkran, setTamEkran] = useState(false);
+  const [adminim, setAdminim] = useState(false);
   const ses = useRef<SesliSohbet | null>(null);
   const kanal = useRef<RealtimeChannel | null>(null);
 
@@ -137,6 +140,7 @@ export default function MasaPage() {
     const k = localStorage.getItem("okey_koltuk");
     if (!t || k === null) { router.replace("/"); return; }
     setToken(t); setKoltuk(Number(k));
+    setAdminim(localStorage.getItem("okey_admin") === "1");
   }, [router]);
 
   // ── Public durumu çek (değişmediyse render tetikleme) ──
@@ -386,7 +390,12 @@ export default function MasaPage() {
       <section className="cuha">
         {pub.faz === "lobi" && (
           <div className="panel">
-            <h2>Masa: {pub.oyuncular.length}/4</h2>
+            <h2>
+              Masa: {pub.oyuncular.length}/4{" "}
+              <span className={`durum-rozet ${pub.masa_acik ? "durum-rozet--acik" : ""}`}>
+                {pub.masa_acik ? "AÇIK" : "KAPALI"}
+              </span>
+            </h2>
             <ul className="panel__liste">
               {pub.oyuncular.map((o) => (
                 <li key={o.koltuk}>
@@ -395,19 +404,54 @@ export default function MasaPage() {
               ))}
             </ul>
             <div className="ayar-grup">
-              <button className={`ayar-btn ${!esli ? "ayar-btn--aktif" : ""}`}
+              <button disabled={!adminim} className={`ayar-btn ${!esli ? "ayar-btn--aktif" : ""}`}
                 onClick={() => api("ayar", { mod: "tekli", katlamali: pub.katlamali })}>Tekli</button>
-              <button className={`ayar-btn ${esli ? "ayar-btn--aktif" : ""}`}
+              <button disabled={!adminim} className={`ayar-btn ${esli ? "ayar-btn--aktif" : ""}`}
                 onClick={() => api("ayar", { mod: "esli", katlamali: pub.katlamali })}>Eşli</button>
               <span className="ayar-ayrac" />
-              <button className={`ayar-btn ${!pub.katlamali ? "ayar-btn--aktif" : ""}`}
+              <button disabled={!adminim} className={`ayar-btn ${!pub.katlamali ? "ayar-btn--aktif" : ""}`}
                 onClick={() => api("ayar", { mod: pub.mod, katlamali: false })}>Katlamasız</button>
-              <button className={`ayar-btn ${pub.katlamali ? "ayar-btn--aktif" : ""}`}
+              <button disabled={!adminim} className={`ayar-btn ${pub.katlamali ? "ayar-btn--aktif" : ""}`}
                 onClick={() => api("ayar", { mod: pub.mod, katlamali: true })}>Katlamalı</button>
             </div>
+
+            {adminim && (
+              <div className="admin">
+                <div className="admin__satir">
+                  <button className={`btn btn--kucuk ${pub.masa_acik ? "btn--kirmizi" : ""}`}
+                    onClick={() => api("masa", { acik: !pub.masa_acik })}>
+                    {pub.masa_acik ? "Masayı Kapat" : "Masayı Aç"}
+                  </button>
+                  <button className="btn btn--kucuk" onClick={() => api("yenioyun")}>Yeni Oyun</button>
+                  <button className="btn btn--kucuk btn--kirmizi"
+                    onClick={() => confirm("Masa tamamen sıfırlanacak, herkes çıkarılacak. Emin misin?") && api("sifirla").then(() => {
+                      localStorage.removeItem("okey_token");
+                      router.replace("/");
+                    })}>Sıfırla</button>
+                </div>
+                {pub.bekleyenler?.length > 0 && (
+                  <div className="admin__bekleyenler">
+                    <span className="admin__baslik">Onay bekleyenler:</span>
+                    {pub.bekleyenler.map((b) => (
+                      <div className="admin__istek" key={b.istekId}>
+                        <span>{b.ad}</span>
+                        <button className="btn btn--kucuk" onClick={() => api("kabul", { istekId: b.istekId })}>Kabul</button>
+                        <button className="btn btn--kucuk btn--kirmizi" onClick={() => api("reddet", { istekId: b.istekId })}>Reddet</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {!adminim && pub.bekleyenler?.length > 0 && (
+              <p className="panel__not">{pub.bekleyenler.length} kişi onay bekliyor</p>
+            )}
             {esli && <p className="panel__not">Eşler karşılıklı oturur: {"0-2 (A)"} ve {"1-3 (B)"} — karşındaki eşindir</p>}
-            {pub.oyuncular.length === 4 && (
+            {pub.oyuncular.length === 4 && adminim && (
               <button className="btn btn--buyuk" onClick={() => api("basla")}>Eli Dağıt</button>
+            )}
+            {pub.oyuncular.length === 4 && !adminim && (
+              <p className="panel__not">Admin eli dağıtınca oyun başlar</p>
             )}
           </div>
         )}
@@ -427,7 +471,14 @@ export default function MasaPage() {
                 <li key={o.koltuk}>{o.ad}: {pub.skorlar[o.koltuk]} ceza</li>
               ))}
             </ul>
-            <button className="btn btn--buyuk" onClick={() => api("basla")}>Yeni El</button>
+            {adminim ? (
+              <div className="admin__satir">
+                <button className="btn btn--buyuk" onClick={() => api("basla")}>Yeni El</button>
+                <button className="btn btn--kucuk" onClick={() => api("yenioyun")}>Yeni Oyun (skorları sıfırla)</button>
+              </div>
+            ) : (
+              <p className="panel__not">Admin yeni eli dağıtınca devam edilir</p>
+            )}
           </div>
         )}
 
