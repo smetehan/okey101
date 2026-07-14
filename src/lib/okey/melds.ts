@@ -74,7 +74,8 @@ function seriDene(
   const sayilar = sabitler.map((s) => s.sayi).sort((a, b) => a - b);
   if (new Set(sayilar).size !== sayilar.length) return null; // aynı sayı iki kez olamaz
 
-  // Normal ardışıklık: mümkün olan tüm pencere başlangıçlarını dene
+  // Normal ardışıklık: tüm pencere başlangıçlarını dene, EN YÜKSEK puanlıyı seç
+  let enIyi: number | null = null;
   for (let baslangic = 1; baslangic <= 14 - toplamUzunluk + (sayilar.includes(1) ? 1 : 0); baslangic++) {
     // pencere: baslangic .. baslangic+len-1 ; 14 = "1" (12-13-1 için)
     let gerekliJoker = 0;
@@ -96,10 +97,10 @@ function seriDene(
     if (kalan.length === 0 && gerekliJoker === joker) {
       // puan: penceredeki değerlerin toplamı (1 uçtaysa 1 puan)
       const puan = pencere.reduce((t, v) => t + v, 0);
-      return puan;
+      if (enIyi === null || puan > enIyi) enIyi = puan;
     }
   }
-  return null;
+  return enIyi;
 }
 
 /** Çift kontrolü: birebir aynı taş (renk+sayı) veya taş+joker */

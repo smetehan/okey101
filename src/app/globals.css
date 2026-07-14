@@ -144,9 +144,9 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
 
 /* ── Rakipler ── */
 .kenar { position: absolute; z-index: 5; }
-.kenar--sol { left: 6px; top: 50%; transform: translateY(-70%); }
-.kenar--sag { right: 6px; top: 50%; transform: translateY(-70%); }
-.kenar--ust { left: 50%; top: 32px; transform: translateX(-50%); }
+.kenar--sol { left: 8px; top: 34px; }
+.kenar--sag { right: 8px; top: 34px; }
+.kenar--ust { left: 50%; top: 34px; transform: translateX(-50%); }
 
 .rakip {
   display: flex;
@@ -184,6 +184,71 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
   border-radius: 4px;
 }
 
+/* Kompakt (oyun içi) rakip: sadece ikon + rozetler */
+.rakip--kompakt {
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 6px;
+}
+.rakip--kompakt .rakip__avatar { position: relative; width: 38px; height: 38px; }
+.rakip__rozet {
+  position: absolute;
+  top: -5px; right: -7px;
+  min-width: 17px; height: 17px;
+  padding: 0 3px;
+  display: grid; place-items: center;
+  border-radius: 9px;
+  background: var(--altin);
+  color: #2e2410;
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 10.5px;
+  box-shadow: 0 1px 3px rgb(0 0 0 / .5);
+}
+.rakip__rozet--acti {
+  top: auto; right: auto;
+  bottom: -4px; left: -6px;
+  background: #4caf6d;
+  color: #fff;
+}
+
+.btn--ikon { padding: 5px 9px; font-size: 15px; line-height: 1; }
+.btn--aktif {
+  background: linear-gradient(180deg, #6fce8a, #3f9c5f);
+  color: #10301c;
+  box-shadow: 0 2px 0 #2c6e43, 0 3px 8px rgb(0 0 0/.35);
+}
+
+/* Canlı sayaç çubuğu */
+.ozet {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 3px 10px;
+}
+.ozet__yazi {
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  color: var(--metin);
+  background: rgb(0 0 0 / .35);
+  border: 1px solid rgb(217 180 91 / .4);
+  border-radius: 10px;
+  padding: 4px 12px;
+}
+.ozet__yazi b { color: var(--altin); }
+
+/* Otomatik dizmede gruba giren taşın altında altın çizgi */
+.tas-grupta { position: relative; display: inline-flex; }
+.tas-grupta::after {
+  content: "";
+  position: absolute;
+  left: 3px; right: 3px; bottom: -3px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--altin);
+}
+
 /* ── Orta çuha ── */
 .cuha {
   display: flex;
@@ -192,7 +257,7 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
   justify-content: center;
   gap: 8px;
   min-height: 0;
-  padding: 46px 120px 4px; /* kenar rakip kartlarına yer bırak */
+  padding: 96px 10px 4px; /* rakip ikonları üst şeritte */
 }
 .orta-alan { display: flex; align-items: center; gap: 18px; }
 .yigin { position: relative; display: grid; place-items: center; }
