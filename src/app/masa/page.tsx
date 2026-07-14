@@ -1,10 +1,11 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase/client";
 import { SesliSohbet } from "@/lib/voice";
 import { Tas } from "@/lib/okey/tiles";
-import { perKontrol, ciftMi, OkeyBilgi } from "@/lib/okey/melds";
+import { perKontrol, ciftMi, OkeyBilgi, SABITLER } from "@/lib/okey/melds";
 import { Tile, KapaliTas } from "@/components/Tile";
 
 // ── Tipler ──────────────────────────────────────────────
@@ -24,19 +25,48 @@ interface PubState {
   skorlar: number[];
   el_no: number;
   son_olay: { tip: string; koltuk: number; mesaj: string; ts: number } | null;
+  updated_at: string;
+}
+
+interface TaslakGrup {
+  idler: number[];
+  tip: "seri" | "cift";
+  puan: number;
 }
 
 const SLOT_SAYISI = 30; // 2 raf × 15
 
 // ── Modül seviyesinde yardımcı komponentler ─────────────
 function RakipKarti({
-  ad, tasSayisi, sirada, acmis, konusuyor, skor, atilanlar, atilanTikla, alinabilir,
+  ad, tasSayisi, sirada, acmis, konusuyor, skor, atilanlar, atilanTikla, alinabilir, kompakt,
 }: {
   ad: string; tasSayisi: number; sirada: boolean; acmis: boolean;
   konusuyor: boolean; skor: number; atilanlar: Tas[];
-  atilanTikla?: () => void; alinabilir?: boolean;
+  atilanTikla?: () => void; alinabilir?: boolean; kompakt?: boolean;
 }) {
   const son = atilanlar[atilanlar.length - 1];
+
+  if (kompakt) {
+    // Oyun sırasında: sadece ikon + rozetler, yer kaplamaz
+    return (
+      <div className={`rakip rakip--kompakt ${sirada ? "rakip--sirada" : ""}`}>
+        <div className={`rakip__avatar ${konusuyor ? "konusuyor" : ""}`} title={`${ad} · ${skor} ceza`}>
+          {ad ? ad[0].toUpperCase() : "?"}
+          <span className="rakip__rozet">{tasSayisi}</span>
+          {acmis && <span className="rakip__rozet rakip__rozet--acti">✓</span>}
+        </div>
+        <span className="rakip__ad-mini">{ad || "—"}</span>
+        <div
+          className={`rakip__atilan ${alinabilir ? "rakip__atilan--alinabilir" : ""}`}
+          onClick={alinabilir ? atilanTikla : undefined}
+          role={alinabilir ? "button" : undefined}
+        >
+          {son ? <Tile tas={son} kucuk /> : <span className="rakip__atilan-bos" />}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`rakip ${sirada ? "rakip--sirada" : ""}`}>
       <div className={`rakip__avatar ${konusuyor ? "konusuyor" : ""}`}>
@@ -68,12 +98,42 @@ export default function MasaPage() {
   const [el, setEl] = useState<Tas[]>([]);
   const [slotlar, setSlotlar] = useState<(number | null)[]>(Array(SLOT_SAYISI).fill(null));
   const [secili, setSecili] = useState<Set<number>>(new Set());
-  const [taslakPerler, setTaslakPerler] = useState<number[][]>([]);
+  const [taslak, setTaslak] = useState<TaslakGrup[]>([]);
   const [mesaj, setMesaj] = useState<string>("");
   const [sesAcik, setSesAcik] = useState(false);
   const [mikrofon, setMikrofon] = useState(true);
   const [konusanlar, setKonusanlar] = useState<Set<number>>(new Set());
+  const [tamEkran, setTamEkran] = useState(false);
   const ses = useRef<SesliSohbet | null>(null);
+  const kanal = useRef<RealtimeChannel | null>(null);
+
+  // ── Tam ekran ──
+  useEffect(() => {
+    const dinle = () => setTamEkran(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", dinle);
+    return () => document.removeEventListener("fullscreenchange", dinle);
+  }, []);
+  const tamEkranToggle = async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+        // Tam ekrandayken yatay kilitle (destekleyen tarayıcılarda)
+        try {
+          const or = screen.orientation as ScreenOrientation & {
+            lock?: (o: string) => Promise<void>;
+          };
+          await or.lock?.("landscape");
+        } catch { /* iOS Safari desteklemez, sorun değil */ }
+      }
+    } catch { /* kullanıcı hareketi olmadan reddedilebilir */ }
+  };
+
+  const uyar = useCallback((m: string) => {
+    setMesaj(m);
+    setTimeout(() => setMesaj(""), 2600);
+  }, []);
 
   // ── Oturum ──
   useEffect(() => {
@@ -83,7 +143,44 @@ export default function MasaPage() {
     setToken(t); setKoltuk(Number(k));
   }, [router]);
 
-  // ── API çağrısı ──
+  // ── Public durumu çek (değişmediyse render tetikleme) ──
+  const pubYenile = useCallback(async () => {
+    const { data } = await supabase.from("game_public").select("*").eq("id", 1).single();
+    if (data) {
+      setPub((eski) =>
+        eski && eski.updated_at === (data as PubState).updated_at ? eski : (data as PubState)
+      );
+    }
+  }, []);
+
+  // ── SENKRONİZASYON: 3 katman ──
+  // 1) postgres_changes (Supabase Replication açıksa anlık)
+  // 2) broadcast "yenile" (her hamle sonrası hamleyi yapan yayınlar — replication'a muhtaç değil)
+  // 3) 3 sn'de bir polling (her ihtimale karşı emniyet kemeri)
+  useEffect(() => {
+    if (!token) return;
+    let aktif = true;
+    pubYenile();
+
+    const k = supabase
+      .channel("masa-sync", { config: { broadcast: { self: false } } })
+      .on("postgres_changes",
+        { event: "UPDATE", schema: "public", table: "game_public" },
+        (p) => aktif && setPub(p.new as PubState))
+      .on("broadcast", { event: "yenile" }, () => aktif && pubYenile())
+      .subscribe();
+    kanal.current = k;
+
+    const zamanlayici = setInterval(() => aktif && pubYenile(), 3000);
+    return () => {
+      aktif = false;
+      clearInterval(zamanlayici);
+      supabase.removeChannel(k);
+      kanal.current = null;
+    };
+  }, [token, pubYenile]);
+
+  // ── API çağrısı: başarılı hamlede herkese "yenile" yayınla ──
   const api = useCallback(async (aksiyon: string, body: object = {}) => {
     const r = await fetch(`/api/game/${aksiyon}`, {
       method: "POST",
@@ -93,32 +190,16 @@ export default function MasaPage() {
     const d = await r.json();
     if (!d.ok) {
       if (r.status === 401) { localStorage.removeItem("okey_token"); router.replace("/"); }
-      setMesaj(d.hata ?? "Hata");
-      setTimeout(() => setMesaj(""), 2600);
+      uyar(d.hata ?? "Hata");
+    } else if (aksiyon !== "durum") {
+      pubYenile(); // kendim hemen göreyim
+      kanal.current?.send({ type: "broadcast", event: "yenile", payload: {} }); // diğerleri de
     }
     return d;
-  }, [token, router]);
-
-  // ── Public durum + realtime ──
-  useEffect(() => {
-    if (!token) return;
-    let aktif = true;
-    const oku = async () => {
-      const { data } = await supabase.from("game_public").select("*").eq("id", 1).single();
-      if (aktif && data) setPub(data as PubState);
-    };
-    oku();
-    const kanal = supabase
-      .channel("masa")
-      .on("postgres_changes",
-        { event: "UPDATE", schema: "public", table: "game_public" },
-        (p) => aktif && setPub(p.new as PubState))
-      .subscribe();
-    return () => { aktif = false; supabase.removeChannel(kanal); };
-  }, [token]);
+  }, [token, router, uyar, pubYenile]);
 
   // ── Kendi elini çek (durum değiştikçe) ──
-  const elImza = pub ? `${pub.el_no}-${pub.el_sayilari?.[koltuk]}` : "";
+  const elImza = pub ? `${pub.el_no}-${pub.el_sayilari?.[koltuk]}-${pub.faz}` : "";
   useEffect(() => {
     if (!token || koltuk < 0 || !pub) return;
     api("durum").then((d) => { if (d.ok) setEl(d.el); });
@@ -139,16 +220,8 @@ export default function MasaPage() {
       return yeni;
     });
     setSecili((s) => new Set([...s].filter((id) => el.some((t) => t.id === id))));
-    setTaslakPerler((p) => p
-      .map((g) => g.filter((id) => el.some((t) => t.id === id)))
-      .filter((g) => g.length > 0));
+    setTaslak((p) => p.filter((g) => g.idler.every((id) => el.some((t) => t.id === id))));
   }, [el]);
-
-  // ── El değişince istaka düzenini sakla/geri yükle ──
-  useEffect(() => {
-    if (!pub) return;
-    localStorage.setItem(`okey_duzen_${pub.el_no}`, JSON.stringify(slotlar));
-  }, [slotlar, pub]);
 
   // ── Ses ──
   const sesBaslat = async () => {
@@ -160,7 +233,7 @@ export default function MasaPage() {
         if (aktif) y.add(k); else y.delete(k);
         return y;
       });
-    s.onDurum = (m) => { setMesaj(m); setTimeout(() => setMesaj(""), 2600); };
+    s.onDurum = uyar;
     const tamam = await s.baslat();
     if (tamam) { ses.current = s; setSesAcik(true); }
   };
@@ -178,18 +251,34 @@ export default function MasaPage() {
   const cekebilir = benimSiram && !pub!.cekti;
   const atabilir = benimSiram && pub!.cekti && secili.size === 1;
   const oncekiKoltuk = (koltuk + 3) % 4;
+  const acmisim = pub?.acanlar?.[koltuk] ?? false;
 
-  const taslakPuan = useMemo(() => {
-    if (!pub?.okey) return 0;
-    let toplam = 0;
-    for (const g of taslakPerler) {
-      const taslar = g.map((id) => tasMap.get(id)!).filter(Boolean);
-      const p = perKontrol(taslar, pub.okey);
-      const c = ciftMi(taslar, pub.okey);
-      toplam += p.gecerli ? p.puan : c.gecerli ? c.puan : 0;
-    }
-    return toplam;
-  }, [taslakPerler, tasMap, pub?.okey]);
+  // Seçili taşların seri/çift olarak anlık değerlendirmesi
+  const seciliTaslar = useMemo(
+    () => [...secili].map((id) => tasMap.get(id)).filter((t): t is Tas => !!t),
+    [secili, tasMap]
+  );
+  const seciliSeri = useMemo(
+    () => (pub?.okey && seciliTaslar.length >= 3 ? perKontrol(seciliTaslar, pub.okey) : null),
+    [seciliTaslar, pub?.okey]
+  );
+  const seciliCift = useMemo(
+    () => (pub?.okey && seciliTaslar.length === 2 ? ciftMi(seciliTaslar, pub.okey) : null),
+    [seciliTaslar, pub?.okey]
+  );
+
+  // Taslak özetleri
+  const taslakTip = taslak[0]?.tip ?? null;
+  const taslakPuan = taslak.reduce((t, g) => t + g.puan, 0);
+  const ciftSayisi = taslak.filter((g) => g.tip === "cift").length;
+  const seriKalan = Math.max(0, SABITLER.ACMA_PUANI - taslakPuan);
+  const ciftKalan = Math.max(0, SABITLER.MIN_CIFT_ACMA - ciftSayisi);
+  // Açılabilir mi? (açmışsa şart yok)
+  const acilabilir =
+    taslak.length > 0 &&
+    (acmisim ||
+      (taslakTip === "seri" && taslakPuan >= SABITLER.ACMA_PUANI) ||
+      (taslakTip === "cift" && ciftSayisi >= SABITLER.MIN_CIFT_ACMA));
 
   // ── Etkileşimler ──
   const tasTikla = (id: number) => {
@@ -200,7 +289,6 @@ export default function MasaPage() {
     });
   };
   const slotTikla = (slotIdx: number) => {
-    // tek taş seçiliyken boş slota tıkla → taşı oraya taşı
     if (secili.size !== 1 || slotlar[slotIdx] !== null) return;
     const id = [...secili][0];
     setSlotlar((eski) => {
@@ -212,22 +300,26 @@ export default function MasaPage() {
     });
     setSecili(new Set());
   };
-  const grupYap = () => {
-    if (secili.size < 2) return;
-    setTaslakPerler((p) => [...p, [...secili]]);
+
+  const seriDiz = () => {
+    if (!seciliSeri?.gecerli) { uyar(seciliSeri?.hata ?? "Geçerli seri/küt seç (en az 3 taş)"); return; }
+    if (!acmisim && taslakTip === "cift") { uyar("İlk açılışta seri ve çift karışmaz"); return; }
+    setTaslak((p) => [...p, { idler: [...secili], tip: "seri", puan: seciliSeri.puan }]);
+    setSecili(new Set());
+  };
+  const ciftDiz = () => {
+    if (!seciliCift?.gecerli) { uyar(seciliCift?.hata ?? "Çift için birebir aynı 2 taş seç"); return; }
+    if (!acmisim && taslakTip === "seri") { uyar("İlk açılışta seri ve çift karışmaz"); return; }
+    setTaslak((p) => [...p, { idler: [...secili], tip: "cift", puan: seciliCift.puan }]);
     setSecili(new Set());
   };
   const ac = async () => {
-    if (taslakPerler.length === 0) return;
-    const d = await api("ac", { gruplar: taslakPerler });
-    if (d.ok) setTaslakPerler([]);
+    if (taslak.length === 0) return;
+    const d = await api("ac", { gruplar: taslak.map((g) => g.idler) });
+    if (d.ok) setTaslak([]);
   };
   const isle = async (perIndex: number) => {
-    if (secili.size !== 1) {
-      setMesaj("İşlemek için elinden tek taş seç");
-      setTimeout(() => setMesaj(""), 2600);
-      return;
-    }
+    if (secili.size !== 1) { uyar("İşlemek için elinden tek taş seç"); return; }
     await api("isle", { perIndex, tasId: [...secili][0] });
     setSecili(new Set());
   };
@@ -254,19 +346,18 @@ export default function MasaPage() {
         atilanlar={pub.atilanlar?.[k] ?? []}
         alinabilir={k === oncekiKoltuk && cekebilir && (pub.atilanlar?.[k]?.length ?? 0) > 0}
         atilanTikla={() => api("cek", { kaynak: "atilan" })}
+        kompakt={pub.faz === "oyun"}
       />
     </div>
   );
 
   return (
     <main className="masa">
-      {/* Dikey uyarısı */}
       <div className="dondur">
         <span className="dondur__ikon">⟳</span>
         Telefonu yan çevirin
       </div>
 
-      {/* Üst çubuk */}
       <header className="ustbar">
         <span className="ustbar__logo">101</span>
         <span className="ustbar__el">El {pub.el_no || "—"}</span>
@@ -276,6 +367,10 @@ export default function MasaPage() {
           </span>
         )}
         <div className="ustbar__ses">
+          <button className="btn btn--kucuk btn--ikon" onClick={tamEkranToggle}
+            aria-label={tamEkran ? "Tam ekrandan çık" : "Tam ekran"}>
+            {tamEkran ? "🡼" : "⛶"}
+          </button>
           {!sesAcik ? (
             <button className="btn btn--kucuk" onClick={sesBaslat}>🎙 Sese katıl</button>
           ) : (
@@ -286,12 +381,10 @@ export default function MasaPage() {
         </div>
       </header>
 
-      {/* Rakipler */}
       {rakip(sol, "sol")}
       {rakip(ust, "ust")}
       {rakip(sag, "sag")}
 
-      {/* Orta: çuha */}
       <section className="cuha">
         {pub.faz === "lobi" && (
           <div className="panel">
@@ -337,8 +430,8 @@ export default function MasaPage() {
               {pub.acilan_perler.map((p, i) => (
                 <div
                   key={i}
-                  className={`per ${benimSiram && pub.acanlar[koltuk] && p.tip !== "cift" ? "per--islenir" : ""}`}
-                  onClick={() => benimSiram && pub.acanlar[koltuk] && p.tip !== "cift" && isle(i)}
+                  className={`per ${benimSiram && acmisim && p.tip !== "cift" ? "per--islenir" : ""}`}
+                  onClick={() => benimSiram && acmisim && p.tip !== "cift" && isle(i)}
                 >
                   <span className="per__sahip">{oyuncuAd(p.koltuk)}</span>
                   {p.taslar.map((t) => <Tile key={t.id} tas={t} kucuk />)}
@@ -349,32 +442,53 @@ export default function MasaPage() {
         )}
       </section>
 
-      {/* Taslak perler */}
-      {taslakPerler.length > 0 && (
+      {/* Taslak: dizilen seriler/çiftler + canlı sayaç */}
+      {taslak.length > 0 && (
         <div className="taslak">
-          {taslakPerler.map((g, i) => (
+          {taslak.map((g, i) => (
             <div className="taslak__grup" key={i}
-              onClick={() => setTaslakPerler((p) => p.filter((_, j) => j !== i))}>
-              {g.map((id) => tasMap.get(id)).filter(Boolean).map((t) => (
+              onClick={() => setTaslak((p) => p.filter((_, j) => j !== i))}>
+              {g.idler.map((id) => tasMap.get(id)).filter(Boolean).map((t) => (
                 <Tile key={t!.id} tas={t!} kucuk />
               ))}
+              <span className="taslak__puan">{g.puan}</span>
             </div>
           ))}
-          <button className="btn" onClick={ac}>
-            AÇ {!pub.acanlar?.[koltuk] ? `(${taslakPuan} puan)` : ""}
-          </button>
+          <span className="taslak__ozet">
+            {taslakTip === "cift"
+              ? `${ciftSayisi} çift · ${taslakPuan} puan${!acmisim && ciftKalan > 0 ? ` · ${ciftKalan} çift kaldı` : ""}`
+              : `Toplam ${taslakPuan}${!acmisim ? ` / ${SABITLER.ACMA_PUANI}${seriKalan > 0 ? ` · ${seriKalan} kaldı` : " ✓"}` : ""}`}
+          </span>
+          <button className="btn" disabled={!acilabilir} onClick={ac}>AÇ</button>
         </div>
       )}
 
-      {/* Aksiyon çubuğu */}
       <div className="aksiyonlar">
         {mesaj && <span className="aksiyonlar__mesaj">{mesaj}</span>}
-        {benimSiram && !pub.cekti && <span className="ipucu">Yığından veya soldan taş çek</span>}
-        <button className="btn" disabled={secili.size < 2} onClick={grupYap}>Per Yap</button>
+        {!mesaj && benimSiram && !pub.cekti && <span className="ipucu">Yığından veya soldan taş çek</span>}
+        {!mesaj && seciliSeri?.gecerli && (
+          <span className="ipucu ipucu--sabit">Seri değeri: {seciliSeri.puan}</span>
+        )}
+        {!mesaj && seciliCift?.gecerli && (
+          <span className="ipucu ipucu--sabit">Çift değeri: {seciliCift.puan} (×2)</span>
+        )}
+        <button
+          className="btn"
+          disabled={!seciliSeri?.gecerli || (!acmisim && taslakTip === "cift")}
+          onClick={seriDiz}
+        >
+          Seri Diz{seciliSeri?.gecerli ? ` +${seciliSeri.puan}` : ""}
+        </button>
+        <button
+          className="btn"
+          disabled={!seciliCift?.gecerli || (!acmisim && taslakTip === "seri")}
+          onClick={ciftDiz}
+        >
+          Çift Diz{seciliCift?.gecerli ? ` +${seciliCift.puan}` : ""}
+        </button>
         <button className="btn btn--kirmizi" disabled={!atabilir} onClick={at}>At</button>
       </div>
 
-      {/* İstaka */}
       <footer className={`istaka ${benimSiram ? "istaka--sirada" : ""}`}>
         {[0, 1].map((raf) => (
           <div className="istaka__raf" key={raf}>
