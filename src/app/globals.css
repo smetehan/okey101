@@ -112,7 +112,7 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
 .masa {
   height: 100dvh;
   display: grid;
-  grid-template-rows: auto auto 1fr auto auto auto;
+  grid-template-rows: auto auto 1fr auto auto;
   position: relative;
   padding: 0 4px env(safe-area-inset-bottom);
 }
@@ -270,21 +270,16 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
 }
 
 /* Canlı sayaç çubuğu */
-.ozet {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 3px 10px;
-}
 .ozet__yazi {
   font-family: var(--font-display);
-  font-size: 14.5px;
+  font-size: 13px;
   color: var(--metin);
   background: rgb(0 0 0 / .35);
   border: 1px solid rgb(217 180 91 / .4);
   border-radius: 10px;
-  padding: 4px 12px;
+  padding: 3px 10px;
+  margin-right: auto;
+  white-space: nowrap;
 }
 .ozet__yazi b { color: var(--altin); }
 
@@ -304,10 +299,11 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
+  justify-content: flex-end; /* içerik istakaya yaslanır, rakiplere değmez */
+  gap: 5px;
   min-height: 0;
-  padding: 2px 10px 4px;
+  overflow: hidden;
+  padding: 2px 10px 2px;
 }
 .orta-alan { display: flex; align-items: center; gap: 18px; }
 .yigin { position: relative; display: grid; place-items: center; }
@@ -514,4 +510,24 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
 :focus-visible { outline: 2px solid var(--altin); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
+}
+
+
+/* ── Kısa ekranlar (çoğu telefon yatayda ≤ 420px) ── */
+@media (max-height: 460px) {
+  :root { --tas-w: clamp(26px, 4.6vw, 36px); }
+  .ustbar { padding: 2px 8px; font-size: 11.5px; }
+  .ustbar__logo { font-size: 15px; }
+  .rakipler { padding: 0 6px; gap: 6px; }
+  .rakip { padding: 2px 6px; gap: 5px; }
+  .rakip--kompakt .rakip__avatar { width: 28px; height: 28px; font-size: 13px; }
+  .rakip__rozet { min-width: 14px; height: 14px; font-size: 9px; top: -4px; right: -6px; }
+  .perler { max-height: none; flex: 1; align-content: flex-end; }
+  .orta-alan { gap: 12px; }
+  .aksiyonlar { padding: 2px 6px; gap: 6px; }
+  .aksiyonlar .btn { padding: 6px 12px; font-size: 13px; }
+  .istaka { padding: 5px 8px 7px; gap: 4px; }
+  .istaka__raf { padding: 2px 3px; gap: 2px; }
+  .panel { padding: 10px 18px; }
+  .panel h2 { font-size: 16px; }
 }

@@ -463,25 +463,23 @@ export default function MasaPage() {
         )}
       </section>
 
-      {/* CANLI SAYAÇ: dizme modu aktifken toplam puan / kalan */}
-      {pub.faz === "oyun" && dizMod && bulgu && (
-        <div className="ozet">
-          <span className="ozet__yazi">
-            {dizMod === "seri"
-              ? <>Seriler: <b>{bulgu.toplam} puan</b>{!acmisim && (
-                  seriKalan > 0 ? <> · 101 için <b>{seriKalan}</b> kaldı</> : <> · ✓ açabilirsin</>
-                )}</>
-              : <><b>{bulgu.ciftSayisi} çift</b> · {bulgu.toplam} puan{!acmisim && (
-                  ciftKalan > 0 ? <> · <b>{ciftKalan}</b> çift kaldı</> : <> · ✓ açabilirsin</>
-                )}</>}
-          </span>
-          <button className="btn" disabled={!acilabilir} onClick={ac}>AÇ</button>
-        </div>
-      )}
-
       <div className="aksiyonlar">
         {mesaj && <span className="aksiyonlar__mesaj">{mesaj}</span>}
+        {!mesaj && pub.faz === "oyun" && dizMod && bulgu && (
+          <span className="ozet__yazi">
+            {dizMod === "seri"
+              ? <>Toplam <b>{bulgu.toplam}</b>{!acmisim && (
+                  seriKalan > 0 ? <> · <b>{seriKalan}</b> kaldı</> : <> ✓</>
+                )}</>
+              : <><b>{bulgu.ciftSayisi}</b> çift · {bulgu.toplam}{!acmisim && (
+                  ciftKalan > 0 ? <> · <b>{ciftKalan}</b> çift kaldı</> : <> ✓</>
+                )}</>}
+          </span>
+        )}
         {!mesaj && benimSiram && !pub.cekti && <span className="ipucu">Yığından veya soldan taş çek</span>}
+        {pub.faz === "oyun" && dizMod && bulgu && (
+          <button className="btn" disabled={!acilabilir} onClick={ac}>AÇ</button>
+        )}
         <button
           className={`btn ${dizMod === "seri" ? "btn--aktif" : ""}`}
           onClick={() => setDizMod((m) => (m === "seri" ? null : "seri"))}
