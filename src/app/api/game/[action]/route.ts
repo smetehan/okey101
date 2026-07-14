@@ -83,6 +83,18 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: true });
   }
 
+  // ── AYAR: eşli/tekli ve katlamalı (sadece el sürerken değil) ──
+  if (action === "ayar") {
+    if (pub.faz === "oyun") return hata("El sürerken ayar değiştirilemez");
+    const mod = body.mod === "esli" ? "esli" : "tekli";
+    const katlamali = !!body.katlamali;
+    await db.from("game_public").update({
+      mod, katlamali,
+      son_olay: olay("ayar", `${mod === "esli" ? "Eşli" : "Tekli"} · ${katlamali ? "Katlamalı" : "Katlamasız"}`),
+    }).eq("id", 1);
+    return NextResponse.json({ ok: true });
+  }
+
   // ── BAŞLA: yeni el dağıt ───────────────────────────────
   if (action === "basla") {
     if ((pub.oyuncular ?? []).length < 4) return hata("4 oyuncu gerekli");
@@ -252,17 +264,28 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         return hata("Açmadan bitilemez");
       }
       const okeyleBitti = okeyMi(tas, okey);
-      const carpan = okeyleBitti ? SABITLER.OKEY_ATARAK_BITME_CARPAN : 1;
+      const ciftActi = (pub.acilan_perler as { koltuk: number; tip: string }[])
+        .some((p) => p.koltuk === koltuk && p.tip === "cift");
+      let carpan = okeyleBitti ? SABITLER.OKEY_ATARAK_BITME_CARPAN : 1;
+      if (pub.katlamali && ciftActi) carpan *= 2; // katlamalı: çiftten giden el ×2
+      const esli = pub.mod === "esli"; // takımlar: koltuk 0-2 ve 1-3
+
       const skorlar: number[] = [...pub.skorlar];
       for (let k = 0; k < 4; k++) {
         if (k === koltuk) continue;
+        if (esli && k % 2 === koltuk % 2) continue; // eşi ceza almaz
         skorlar[k] += elCezasi(eller[k], okey, pub.acanlar[k]) * carpan;
       }
+      const notlar = [
+        okeyleBitti ? "Okey atarak" : "",
+        pub.katlamali && ciftActi ? "çiftten" : "",
+      ].filter(Boolean).join(" + ");
       await Promise.all([
         db.from("game_public").update({
           faz: "el_sonu", atilanlar, skorlar,
           el_sayilari: eller.map((e) => e.length),
-          son_olay: olay("bitti", okeyleBitti ? "Okey atarak bitirdi! (2×)" : "Eli bitirdi"),
+          son_olay: olay("bitti",
+            `Eli bitirdi${notlar ? ` (${notlar}, ×${carpan})` : ""}`),
         }).eq("id", 1),
         db.from("game_private").update({ eller }).eq("id", 1),
       ]);

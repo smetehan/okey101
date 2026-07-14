@@ -25,6 +25,8 @@ interface PubState {
   acanlar: boolean[];
   skorlar: number[];
   el_no: number;
+  mod: "tekli" | "esli";
+  katlamali: boolean;
   son_olay: { tip: string; koltuk: number; mesaj: string; ts: number } | null;
   updated_at: string;
 }
@@ -33,11 +35,11 @@ const SLOT_SAYISI = 30; // 2 raf × 15
 
 // ── Modül seviyesinde yardımcı komponentler ─────────────
 function RakipKarti({
-  ad, tasSayisi, sirada, acmis, konusuyor, skor, atilanlar, atilanTikla, alinabilir, kompakt,
+  ad, tasSayisi, sirada, acmis, konusuyor, skor, atilanlar, atilanTikla, alinabilir, kompakt, es,
 }: {
   ad: string; tasSayisi: number; sirada: boolean; acmis: boolean;
   konusuyor: boolean; skor: number; atilanlar: Tas[];
-  atilanTikla?: () => void; alinabilir?: boolean; kompakt?: boolean;
+  atilanTikla?: () => void; alinabilir?: boolean; kompakt?: boolean; es?: boolean;
 }) {
   const son = atilanlar[atilanlar.length - 1];
 
@@ -50,6 +52,7 @@ function RakipKarti({
           <span className="rakip__rozet">{tasSayisi}</span>
           {acmis && <span className="rakip__rozet rakip__rozet--acti">✓</span>}
         </div>
+        {es && <span className="rakip__es">EŞİN</span>}
         <div
           className={`rakip__atilan ${alinabilir ? "rakip__atilan--alinabilir" : ""}`}
           onClick={alinabilir ? atilanTikla : undefined}
@@ -67,7 +70,7 @@ function RakipKarti({
         {ad ? ad[0].toUpperCase() : "?"}
       </div>
       <div className="rakip__bilgi">
-        <span className="rakip__ad">{ad || "Bekleniyor"}</span>
+        <span className="rakip__ad">{ad || "Bekleniyor"}{es ? " · eşin" : ""}</span>
         <span className="rakip__detay">
           {tasSayisi} taş · {skor} ceza {acmis ? "· açtı" : ""}
         </span>
@@ -323,9 +326,11 @@ export default function MasaPage() {
   // Koltuk yerleşimi: ben altta; sıra yönünde sağ → üst → sol (hepsi üst boşlukta)
   const sag = (koltuk + 1) % 4, ust = (koltuk + 2) % 4, sol = (koltuk + 3) % 4;
   const oyuncuAd = (k: number) => pub.oyuncular.find((o) => o.koltuk === k)?.ad ?? "";
-  const rakip = (k: number, konum: string) => (
-    <div className={`kenar kenar--${konum}`} key={k}>
+  const esli = pub.mod === "esli";
+  const rakip = (k: number, es = false) => (
+    <div className="rakipler__hucre" key={k}>
       <RakipKarti
+        es={es}
         ad={oyuncuAd(k)}
         tasSayisi={pub.el_sayilari?.[k] ?? 0}
         sirada={pub.faz === "oyun" && pub.sira === k}
@@ -349,7 +354,9 @@ export default function MasaPage() {
 
       <header className="ustbar">
         <span className="ustbar__logo">101</span>
-        <span className="ustbar__el">El {pub.el_no || "—"}</span>
+        <span className="ustbar__el">
+          El {pub.el_no || "—"} · {esli ? "Eşli" : "Tekli"}{pub.katlamali ? " · Katlamalı" : ""}
+        </span>
         {pub.son_olay && (
           <span className="ustbar__olay">
             {oyuncuAd(pub.son_olay.koltuk)}: {pub.son_olay.mesaj}
@@ -370,17 +377,35 @@ export default function MasaPage() {
         </div>
       </header>
 
-      {rakip(sol, "sol")}
-      {rakip(ust, "ust")}
-      {rakip(sag, "sag")}
+      <div className="rakipler">
+        {rakip(sol)}
+        {rakip(ust, esli)}
+        {rakip(sag)}
+      </div>
 
       <section className="cuha">
         {pub.faz === "lobi" && (
           <div className="panel">
             <h2>Masa: {pub.oyuncular.length}/4</h2>
             <ul className="panel__liste">
-              {pub.oyuncular.map((o) => <li key={o.koltuk}>{o.ad}</li>)}
+              {pub.oyuncular.map((o) => (
+                <li key={o.koltuk}>
+                  {o.ad}{esli ? ` — Takım ${o.koltuk % 2 === 0 ? "A" : "B"}` : ""}
+                </li>
+              ))}
             </ul>
+            <div className="ayar-grup">
+              <button className={`ayar-btn ${!esli ? "ayar-btn--aktif" : ""}`}
+                onClick={() => api("ayar", { mod: "tekli", katlamali: pub.katlamali })}>Tekli</button>
+              <button className={`ayar-btn ${esli ? "ayar-btn--aktif" : ""}`}
+                onClick={() => api("ayar", { mod: "esli", katlamali: pub.katlamali })}>Eşli</button>
+              <span className="ayar-ayrac" />
+              <button className={`ayar-btn ${!pub.katlamali ? "ayar-btn--aktif" : ""}`}
+                onClick={() => api("ayar", { mod: pub.mod, katlamali: false })}>Katlamasız</button>
+              <button className={`ayar-btn ${pub.katlamali ? "ayar-btn--aktif" : ""}`}
+                onClick={() => api("ayar", { mod: pub.mod, katlamali: true })}>Katlamalı</button>
+            </div>
+            {esli && <p className="panel__not">Eşler karşılıklı oturur: {"0-2 (A)"} ve {"1-3 (B)"} — karşındaki eşindir</p>}
             {pub.oyuncular.length === 4 && (
               <button className="btn btn--buyuk" onClick={() => api("basla")}>Eli Dağıt</button>
             )}
@@ -390,6 +415,13 @@ export default function MasaPage() {
         {pub.faz === "el_sonu" && (
           <div className="panel">
             <h2>El bitti</h2>
+            {esli && (
+              <p className="panel__takim">
+                Biz: <b>{(pub.skorlar[koltuk % 2] ?? 0) + (pub.skorlar[(koltuk % 2) + 2] ?? 0)}</b>
+                {" — "}
+                Onlar: <b>{(pub.skorlar[(koltuk + 1) % 2] ?? 0) + (pub.skorlar[((koltuk + 1) % 2) + 2] ?? 0)}</b>
+              </p>
+            )}
             <ul className="panel__liste">
               {pub.oyuncular.map((o) => (
                 <li key={o.koltuk}>{o.ad}: {pub.skorlar[o.koltuk]} ceza</li>
