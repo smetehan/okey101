@@ -10,68 +10,129 @@ type Ctx = { params: Promise<{ action: string }> };
 const hata = (mesaj: string, kod = 400) =>
   NextResponse.json({ ok: false, hata: mesaj }, { status: kod });
 
+const sifreGecerli = (sifre?: string) =>
+  sifre === process.env.MASA_SIFRESI ||
+  (!!process.env.ADMIN_SIFRESI && sifre === process.env.ADMIN_SIFRESI);
+
+const superAdminMi = (sifre?: string) =>
+  !!process.env.ADMIN_SIFRESI && sifre === process.env.ADMIN_SIFRESI;
+
 export async function POST(req: NextRequest, ctx: Ctx) {
   const { action } = await ctx.params;
   const db = supabaseAdmin();
   const body = await req.json().catch(() => ({}));
 
-  // ── Durumları oku; satırlar silinmişse KENDİNİ ONAR ────
-  let [{ data: pub }, { data: prv }] = await Promise.all([
-    db.from("game_public").select("*").eq("id", 1).maybeSingle(),
-    db.from("game_private").select("*").eq("id", 1).maybeSingle(),
+  // ── KİM: şifreyi doğrula, rolü söyle (giriş ekranı yönlendirmesi) ──
+  if (action === "kim") {
+    const { sifre } = body as { sifre?: string };
+    if (!sifreGecerli(sifre)) return hata("Şifre yanlış", 401);
+    return NextResponse.json({ ok: true, admin: superAdminMi(sifre) });
+  }
+
+  // ── PANEL: süper admin masa açar (boş masa, katılıma açık) ──
+  if (action === "masaac") {
+    const { sifre, masaAdi } = body as { sifre?: string; masaAdi?: string };
+    if (!superAdminMi(sifre)) return hata("Yetkisiz", 403);
+    const masaAdiT = (masaAdi ?? "").trim().slice(0, 24) || "Yeni Masa";
+    const { data: yeni, error } = await db
+      .from("game_public")
+      .insert({ masa_adi: masaAdiT, masa_acik: true })
+      .select("id")
+      .single();
+    if (error || !yeni) return hata("Masa açılamadı: " + (error?.message ?? ""), 500);
+    await db.from("game_private").insert({ id: yeni.id });
+    return NextResponse.json({ ok: true, masaId: yeni.id });
+  }
+
+  // ── PANEL: masa aç/kapa ──
+  if (action === "panelmasa") {
+    const { sifre, masaId: mid, acik } = body as { sifre?: string; masaId?: number; acik?: boolean };
+    if (!superAdminMi(sifre)) return hata("Yetkisiz", 403);
+    const guncel: Record<string, unknown> = { masa_acik: !!acik };
+    if (!acik) guncel.bekleyenler = [];
+    await db.from("game_public").update(guncel).eq("id", Number(mid));
+    if (!acik) await db.from("game_private").update({ bekleyen_tokenlar: {} }).eq("id", Number(mid));
+    return NextResponse.json({ ok: true });
+  }
+
+  // ── PANEL: masa sil ──
+  if (action === "panelsil") {
+    const { sifre, masaId: mid } = body as { sifre?: string; masaId?: number };
+    if (!superAdminMi(sifre)) return hata("Yetkisiz", 403);
+    await db.from("game_public").delete().eq("id", Number(mid));
+    return NextResponse.json({ ok: true });
+  }
+
+  // ── Masa kapsamı: diğer tüm aksiyonlar masaId ister ────
+  const masaId = Number(body.masaId);
+  if (!masaId) return hata("masaId gerekli");
+
+  const [{ data: pub }, { data: prv }] = await Promise.all([
+    db.from("game_public").select("*").eq("id", masaId).maybeSingle(),
+    db.from("game_private").select("*").eq("id", masaId).maybeSingle(),
   ]);
-  if (!pub) {
-    await db.from("game_public").upsert({ id: 1 });
-    ({ data: pub } = await db.from("game_public").select("*").eq("id", 1).single());
-  }
-  if (!prv) {
-    await db.from("game_private").upsert({ id: 1 });
-    ({ data: prv } = await db.from("game_private").select("*").eq("id", 1).single());
-  }
-  if (!pub || !prv) return hata("Masa oluşturulamadı — schema.sql çalıştırıldı mı?", 500);
+  if (!pub || !prv) return hata("Masa bulunamadı — silinmiş olabilir", 404);
 
   const oyuncular: { koltuk: number; ad: string }[] = pub.oyuncular ?? [];
   const tokenlar: Record<string, string> = prv.tokenlar ?? {};
+  const adminKoltuklar: number[] = prv.admin_koltuklar ?? [];
   const bekleyenler: { istekId: string; ad: string }[] = pub.bekleyenler ?? [];
   const bekleyenTokenlar: Record<string, string> = prv.bekleyen_tokenlar ?? {};
 
-  // ── GİRİŞ ──────────────────────────────────────────────
+  // ── GİRİŞ (mevcut masaya) ──────────────────────────────
   if (action === "giris") {
     const { ad, sifre } = body as { ad?: string; sifre?: string };
     if (!ad?.trim()) return hata("Kullanıcı adı gerekli");
+    if (!sifreGecerli(sifre)) return hata("Şifre yanlış", 401);
     const adT = ad.trim().slice(0, 16);
-
-    const adminMi = !!process.env.ADMIN_SIFRESI && sifre === process.env.ADMIN_SIFRESI;
-    if (!adminMi && sifre !== process.env.MASA_SIFRESI) return hata("Şifre yanlış", 401);
-
+    const superAdmin = superAdminMi(sifre);
     const token = globalThis.crypto.randomUUID();
 
-    // Yeniden bağlanma: adı zaten koltukta olan token'ını yeniler
+    // Yeniden bağlanma: adı koltukta olan token'ını yeniler (admin yetkisi koltukta kalır)
     const mevcut = oyuncular.find((o) => o.ad === adT);
     if (mevcut) {
       tokenlar[String(mevcut.koltuk)] = token;
-      const guncel: Record<string, unknown> = { tokenlar };
-      if (adminMi) guncel.admin_token = token;
-      await db.from("game_private").update(guncel).eq("id", 1);
-      return NextResponse.json({ ok: true, token, koltuk: mevcut.koltuk, ad: adT, admin: adminMi });
+      if (superAdmin && !adminKoltuklar.includes(mevcut.koltuk)) adminKoltuklar.push(mevcut.koltuk);
+      await db.from("game_private")
+        .update({ tokenlar, admin_koltuklar: adminKoltuklar }).eq("id", masaId);
+      return NextResponse.json({
+        ok: true, token, koltuk: mevcut.koltuk, masaId, ad: adT,
+        admin: adminKoltuklar.includes(mevcut.koltuk),
+      });
     }
 
-    // Admin: onaysız, masa kapalı olsa bile oturur
-    if (adminMi) {
+    // BOŞ MASAYA İLK OTURAN o masanın admini olur
+    if (oyuncular.length === 0) {
+      oyuncular.push({ koltuk: 0, ad: adT });
+      tokenlar["0"] = token;
+      const yeniAdminler = superAdmin ? [0] : [0];
+      await Promise.all([
+        db.from("game_public").update({
+          oyuncular,
+          son_olay: { tip: "admin", koltuk: 0, mesaj: `${adT} masanın admini oldu`, ts: Date.now() },
+        }).eq("id", masaId),
+        db.from("game_private").update({ tokenlar, admin_koltuklar: yeniAdminler }).eq("id", masaId),
+      ]);
+      return NextResponse.json({ ok: true, token, koltuk: 0, masaId, ad: adT, admin: true });
+    }
+
+    // Süper admin: onaysız, masa kapalı olsa bile oturur
+    if (superAdmin) {
       const dolu = new Set(oyuncular.map((o) => o.koltuk));
       const koltuk = [0, 1, 2, 3].find((k) => !dolu.has(k));
       if (koltuk === undefined) return hata("Masa dolu (4/4)", 409);
       oyuncular.push({ koltuk, ad: adT });
       tokenlar[String(koltuk)] = token;
+      adminKoltuklar.push(koltuk);
       await Promise.all([
-        db.from("game_public").update({ oyuncular }).eq("id", 1),
-        db.from("game_private").update({ tokenlar, admin_token: token }).eq("id", 1),
+        db.from("game_public").update({ oyuncular }).eq("id", masaId),
+        db.from("game_private").update({ tokenlar, admin_koltuklar: adminKoltuklar }).eq("id", masaId),
       ]);
-      return NextResponse.json({ ok: true, token, koltuk, ad: adT, admin: true });
+      return NextResponse.json({ ok: true, token, koltuk, masaId, ad: adT, admin: true });
     }
 
-    // Normal oyuncu: masa açık olmalı, admin onayına düşer
-    if (!pub.masa_acik) return hata("Masa şu an kapalı — adminin masayı açması gerekiyor", 403);
+    // Normal oyuncu: masa açık olmalı, masa adminin onayına düşer
+    if (!pub.masa_acik) return hata("Bu masa şu an kapalı", 403);
     const istekId = globalThis.crypto.randomUUID();
     const eski = bekleyenler.find((b) => b.ad === adT);
     if (eski) {
@@ -82,10 +143,10 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     }
     bekleyenTokenlar[istekId] = token;
     await Promise.all([
-      db.from("game_public").update({ bekleyenler }).eq("id", 1),
-      db.from("game_private").update({ bekleyen_tokenlar: bekleyenTokenlar }).eq("id", 1),
+      db.from("game_public").update({ bekleyenler }).eq("id", masaId),
+      db.from("game_private").update({ bekleyen_tokenlar: bekleyenTokenlar }).eq("id", masaId),
     ]);
-    return NextResponse.json({ ok: true, beklemede: true, token, ad: adT });
+    return NextResponse.json({ ok: true, beklemede: true, token, masaId, ad: adT });
   }
 
   // ── Token çözümle ──────────────────────────────────────
@@ -105,7 +166,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
   const koltukStr = Object.entries(tokenlar).find(([, t]) => t === token)?.[0];
   if (koltukStr === undefined) return hata("Oturum geçersiz — tekrar giriş yapın", 401);
   const koltuk = Number(koltukStr);
-  const adminMi = !!token && token === prv.admin_token;
+  const adminMi = adminKoltuklar.includes(koltuk);
 
   const eller: Tas[][] = prv.eller ?? [[], [], [], []];
   const yigin: Tas[] = prv.yigin ?? [];
@@ -118,7 +179,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
   }
 
   // ═══════════ ADMİN AKSİYONLARI ═══════════
-  if (["masa", "kabul", "reddet", "yenioyun", "sifirla", "ayar", "basla"].includes(action) && !adminMi)
+  if (["masa", "kabul", "reddet", "yenioyun", "sifirla", "masasil", "ayar", "basla"].includes(action) && !adminMi)
     return hata("Bu işlem için admin yetkisi gerekir", 403);
 
   // ── MASA: aç / kapat ──
@@ -128,15 +189,17 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       masa_acik: acik,
       son_olay: olay("masa", acik ? "Masa açıldı" : "Masa kapatıldı"),
     };
-    if (!acik) guncelPub.bekleyenler = []; // kapanınca kuyruk boşalır
+    if (!acik) guncelPub.bekleyenler = [];
     await Promise.all([
-      db.from("game_public").update(guncelPub).eq("id", 1),
-      acik ? Promise.resolve() : db.from("game_private").update({ bekleyen_tokenlar: {} }).eq("id", 1),
+      db.from("game_public").update(guncelPub).eq("id", masaId),
+      acik
+        ? Promise.resolve()
+        : db.from("game_private").update({ bekleyen_tokenlar: {} }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
 
-  // ── KABUL: bekleyen oyuncuyu koltuğa oturt ──
+  // ── KABUL ──
   if (action === "kabul") {
     const { istekId } = body as { istekId: string };
     const idx = bekleyenler.findIndex((b) => b.istekId === istekId);
@@ -152,8 +215,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       db.from("game_public").update({
         oyuncular, bekleyenler,
         son_olay: olay("kabul", `${istek.ad} masaya kabul edildi`),
-      }).eq("id", 1),
-      db.from("game_private").update({ tokenlar, bekleyen_tokenlar: bekleyenTokenlar }).eq("id", 1),
+      }).eq("id", masaId),
+      db.from("game_private").update({ tokenlar, bekleyen_tokenlar: bekleyenTokenlar }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
@@ -166,13 +229,13 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     bekleyenler.splice(idx, 1);
     delete bekleyenTokenlar[istekId];
     await Promise.all([
-      db.from("game_public").update({ bekleyenler }).eq("id", 1),
-      db.from("game_private").update({ bekleyen_tokenlar: bekleyenTokenlar }).eq("id", 1),
+      db.from("game_public").update({ bekleyenler }).eq("id", masaId),
+      db.from("game_private").update({ bekleyen_tokenlar: bekleyenTokenlar }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
 
-  // ── YENİ OYUN: skorlar/eller sıfırlanır, oyuncular kalır ──
+  // ── YENİ OYUN: skorlar sıfır, oyuncular kalır ──
   if (action === "yenioyun") {
     await Promise.all([
       db.from("game_public").update({
@@ -180,14 +243,14 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         yigin_sayisi: 0, el_sayilari: [0, 0, 0, 0], atilanlar: [[], [], [], []],
         acilan_perler: [], acanlar: [false, false, false, false],
         skorlar: [0, 0, 0, 0], el_no: 0,
-        son_olay: olay("yenioyun", "Yeni oyun başlatıldı — skorlar sıfırlandı"),
-      }).eq("id", 1),
-      db.from("game_private").update({ yigin: [], eller: [[], [], [], []] }).eq("id", 1),
+        son_olay: olay("yenioyun", "Yeni oyun — skorlar sıfırlandı"),
+      }).eq("id", masaId),
+      db.from("game_private").update({ yigin: [], eller: [[], [], [], []] }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
 
-  // ── SIFIRLA: masa tamamen boşalır (herkes çıkar) ──
+  // ── SIFIRLA: masa boşalır ama silinmez ──
   if (action === "sifirla") {
     await Promise.all([
       db.from("game_public").update({
@@ -197,31 +260,39 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         skorlar: [0, 0, 0, 0], el_no: 0, oyuncular: [], bekleyenler: [],
         masa_acik: false,
         son_olay: { tip: "sifirla", koltuk: -1, mesaj: "Masa sıfırlandı", ts: Date.now() },
-      }).eq("id", 1),
+      }).eq("id", masaId),
       db.from("game_private").update({
         yigin: [], eller: [[], [], [], []], tokenlar: {},
-        bekleyen_tokenlar: {}, admin_token: null,
-      }).eq("id", 1),
+        bekleyen_tokenlar: {}, admin_koltuklar: [],
+      }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
 
-  // ── AYAR: eşli/tekli ve katlamalı ──
+  // ── MASAYI SİL: satır silinir (private cascade ile gider) ──
+  if (action === "masasil") {
+    await db.from("game_public").delete().eq("id", masaId);
+    return NextResponse.json({ ok: true });
+  }
+
+  // ── AYAR ──
   if (action === "ayar") {
     if (pub.faz === "oyun") return hata("El sürerken ayar değiştirilemez");
     const mod = body.mod === "esli" ? "esli" : "tekli";
     const katlamali = !!body.katlamali;
+    const elHedef = Math.min(25, Math.max(1, Number(body.elHedef) || pub.el_hedef || 5));
     await db.from("game_public").update({
-      mod, katlamali,
-      son_olay: olay("ayar", `${mod === "esli" ? "Eşli" : "Tekli"} · ${katlamali ? "Katlamalı" : "Katlamasız"}`),
-    }).eq("id", 1);
+      mod, katlamali, el_hedef: elHedef,
+      son_olay: olay("ayar", `${mod === "esli" ? "Eşli" : "Tekli"} · ${katlamali ? "Katlamalı" : "Katlamasız"} · ${elHedef} el`),
+    }).eq("id", masaId);
     return NextResponse.json({ ok: true });
   }
 
-  // ── BAŞLA: yeni el dağıt ──
+  // ── BAŞLA ──
   if (action === "basla") {
     if (oyuncular.length < 4) return hata("4 oyuncu gerekli");
     if (pub.faz === "oyun") return hata("El zaten devam ediyor");
+    if (pub.faz === "oyun_sonu") return hata("Oyun bitti — Yeni Oyun başlatın");
 
     const baslayan =
       pub.el_no === 0
@@ -239,8 +310,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         acanlar: [false, false, false, false],
         el_no: (pub.el_no ?? 0) + 1,
         son_olay: olay("basla", `El ${(pub.el_no ?? 0) + 1} başladı`),
-      }).eq("id", 1),
-      db.from("game_private").update({ yigin: d.yigin, eller: d.eller }).eq("id", 1),
+      }).eq("id", masaId),
+      db.from("game_private").update({ yigin: d.yigin, eller: d.eller }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
@@ -263,7 +334,7 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         await db.from("game_public").update({
           faz: "el_sonu",
           son_olay: olay("berabere", "Yığın bitti — el berabere"),
-        }).eq("id", 1);
+        }).eq("id", masaId);
         return NextResponse.json({ ok: true, berabere: true });
       }
     } else {
@@ -278,8 +349,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         cekti: true, yigin_sayisi: yigin.length, atilanlar,
         el_sayilari: eller.map((e) => e.length),
         son_olay: olay("cek", kaynak === "yigin" ? "Yığından çekti" : "Atılanı aldı"),
-      }).eq("id", 1),
-      db.from("game_private").update({ yigin, eller }).eq("id", 1),
+      }).eq("id", masaId),
+      db.from("game_private").update({ yigin, eller }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true, tas });
   }
@@ -328,8 +399,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         acilan_perler: acilan, acanlar,
         el_sayilari: eller.map((e) => e.length),
         son_olay: olay("ac", `${gruplar.length} per açtı`),
-      }).eq("id", 1),
-      db.from("game_private").update({ eller }).eq("id", 1),
+      }).eq("id", masaId),
+      db.from("game_private").update({ eller }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
@@ -358,8 +429,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         acilan_perler: acilan,
         el_sayilari: eller.map((e) => e.length),
         son_olay: olay("isle", "Pere taş işledi"),
-      }).eq("id", 1),
-      db.from("game_private").update({ eller }).eq("id", 1),
+      }).eq("id", masaId),
+      db.from("game_private").update({ eller }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }
@@ -391,20 +462,24 @@ export async function POST(req: NextRequest, ctx: Ctx) {
       const skorlar: number[] = [...pub.skorlar];
       for (let k = 0; k < 4; k++) {
         if (k === koltuk) continue;
-        if (esli && k % 2 === koltuk % 2) continue; // eşi ceza almaz
+        if (esli && k % 2 === koltuk % 2) continue;
         skorlar[k] += elCezasi(eller[k], okey, pub.acanlar[k]) * carpan;
       }
       const notlar = [
         okeyleBitti ? "Okey atarak" : "",
         pub.katlamali && ciftActi ? "çiftten" : "",
       ].filter(Boolean).join(" + ");
+      const oyunBitti = (pub.el_no ?? 1) >= (pub.el_hedef ?? 5);
       await Promise.all([
         db.from("game_public").update({
-          faz: "el_sonu", atilanlar, skorlar,
+          faz: oyunBitti ? "oyun_sonu" : "el_sonu", atilanlar, skorlar,
           el_sayilari: eller.map((e) => e.length),
-          son_olay: olay("bitti", `Eli bitirdi${notlar ? ` (${notlar}, ×${carpan})` : ""}`),
-        }).eq("id", 1),
-        db.from("game_private").update({ eller }).eq("id", 1),
+          son_olay: olay("bitti",
+            oyunBitti
+              ? `Oyun bitti! Son eli kazandı${notlar ? ` (${notlar}, ×${carpan})` : ""}`
+              : `Eli bitirdi${notlar ? ` (${notlar}, ×${carpan})` : ""}`),
+        }).eq("id", masaId),
+        db.from("game_private").update({ eller }).eq("id", masaId),
       ]);
       return NextResponse.json({ ok: true, bitti: true });
     }
@@ -414,8 +489,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
         atilanlar, sira: (koltuk + 1) % 4, cekti: false,
         el_sayilari: eller.map((e) => e.length),
         son_olay: olay("at", "Taş attı"),
-      }).eq("id", 1),
-      db.from("game_private").update({ eller }).eq("id", 1),
+      }).eq("id", masaId),
+      db.from("game_private").update({ eller }).eq("id", masaId),
     ]);
     return NextResponse.json({ ok: true });
   }

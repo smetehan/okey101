@@ -23,6 +23,7 @@ type Sinyal =
 
 export class SesliSohbet {
   private koltuk: number;
+  private masaId: number;
   private kanal: RealtimeChannel | null = null;
   private yerel: MediaStream | null = null;
   private esler = new Map<number, RTCPeerConnection>();
@@ -31,8 +32,9 @@ export class SesliSohbet {
   onKonusma?: (koltuk: number, konusuyor: boolean) => void;
   onDurum?: (mesaj: string) => void;
 
-  constructor(koltuk: number) {
+  constructor(koltuk: number, masaId: number) {
     this.koltuk = koltuk;
+    this.masaId = masaId;
   }
 
   async baslat(): Promise<boolean> {
@@ -45,7 +47,7 @@ export class SesliSohbet {
       return false;
     }
 
-    this.kanal = supabase.channel("ses-sinyal", {
+    this.kanal = supabase.channel(`ses-sinyal-${this.masaId}`, {
       config: { broadcast: { self: false } },
     });
 

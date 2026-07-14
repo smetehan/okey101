@@ -11,7 +11,9 @@ import { Tile, KapaliTas } from "@/components/Tile";
 
 // ── Tipler ──────────────────────────────────────────────
 interface PubState {
-  faz: "lobi" | "oyun" | "el_sonu";
+  masa_adi: string;
+  faz: "lobi" | "oyun" | "el_sonu" | "oyun_sonu";
+  el_hedef: number;
   oyuncular: { koltuk: number; ad: string }[];
   sira: number | null;
   cekti: boolean;
@@ -92,6 +94,7 @@ function RakipKarti({
 export default function MasaPage() {
   const router = useRouter();
   const [token, setToken] = useState<string | null>(null);
+  const [masaId, setMasaId] = useState<number>(0);
   const [koltuk, setKoltuk] = useState<number>(-1);
   const [pub, setPub] = useState<PubState | null>(null);
   const [el, setEl] = useState<Tas[]>([]);
@@ -138,31 +141,38 @@ export default function MasaPage() {
   useEffect(() => {
     const t = localStorage.getItem("okey_token");
     const k = localStorage.getItem("okey_koltuk");
-    if (!t || k === null) { router.replace("/"); return; }
-    setToken(t); setKoltuk(Number(k));
+    const m = localStorage.getItem("okey_masa");
+    if (!t || k === null || !m) { router.replace("/"); return; }
+    setToken(t); setKoltuk(Number(k)); setMasaId(Number(m));
     setAdminim(localStorage.getItem("okey_admin") === "1");
   }, [router]);
 
   // ── Public durumu çek (değişmediyse render tetikleme) ──
   const pubYenile = useCallback(async () => {
-    const { data } = await supabase.from("game_public").select("*").eq("id", 1).single();
-    if (data) {
+    if (!masaId) return;
+    const { data } = await supabase.from("game_public").select("*").eq("id", masaId).maybeSingle();
+    if (!data) { // masa silinmiş
+      localStorage.removeItem("okey_token");
+      router.replace("/");
+      return;
+    }
+    {
       setPub((eski) =>
         eski && eski.updated_at === (data as PubState).updated_at ? eski : (data as PubState)
       );
     }
-  }, []);
+  }, [masaId, router]);
 
   // ── SENKRONİZASYON: postgres_changes + broadcast + polling ──
   useEffect(() => {
-    if (!token) return;
+    if (!token || !masaId) return;
     let aktif = true;
     pubYenile();
 
     const k = supabase
-      .channel("masa-sync", { config: { broadcast: { self: false } } })
+      .channel(`masa-sync-${masaId}`, { config: { broadcast: { self: false } } })
       .on("postgres_changes",
-        { event: "UPDATE", schema: "public", table: "game_public" },
+        { event: "UPDATE", schema: "public", table: "game_public", filter: `id=eq.${masaId}` },
         (p) => aktif && setPub(p.new as PubState))
       .on("broadcast", { event: "yenile" }, () => aktif && pubYenile())
       .subscribe();
@@ -175,14 +185,14 @@ export default function MasaPage() {
       supabase.removeChannel(k);
       kanal.current = null;
     };
-  }, [token, pubYenile]);
+  }, [token, masaId, pubYenile]);
 
   // ── API: başarılı hamlede herkese "yenile" yayınla ──
   const api = useCallback(async (aksiyon: string, body: object = {}) => {
     const r = await fetch(`/api/game/${aksiyon}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-oyuncu-token": token ?? "" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ masaId, ...body }),
     });
     const d = await r.json();
     if (!d.ok) {
@@ -193,13 +203,15 @@ export default function MasaPage() {
       kanal.current?.send({ type: "broadcast", event: "yenile", payload: {} });
     }
     return d;
-  }, [token, router, uyar, pubYenile]);
+  }, [token, masaId, router, uyar, pubYenile]);
 
   // ── Kendi elini çek ──
   const elImza = pub ? `${pub.el_no}-${pub.el_sayilari?.[koltuk]}-${pub.faz}` : "";
   useEffect(() => {
     if (!token || koltuk < 0 || !pub) return;
-    api("durum").then((d) => { if (d.ok) setEl(d.el); });
+    api("durum").then((d) => {
+      if (d.ok) { setEl(d.el); setAdminim(!!d.admin); }
+    });
   }, [token, koltuk, elImza]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── OTOMATİK DİZME: aktif modda seriler/çiftler anlık bulunur ──
@@ -252,7 +264,7 @@ export default function MasaPage() {
   // ── Ses ──
   const sesBaslat = async () => {
     if (ses.current) return;
-    const s = new SesliSohbet(koltuk);
+    const s = new SesliSohbet(koltuk, masaId);
     s.onKonusma = (k, aktif) =>
       setKonusanlar((eski) => {
         const y = new Set(eski);
@@ -359,7 +371,7 @@ export default function MasaPage() {
       <header className="ustbar">
         <span className="ustbar__logo">101</span>
         <span className="ustbar__el">
-          El {pub.el_no || "—"} · {esli ? "Eşli" : "Tekli"}{pub.katlamali ? " · Katlamalı" : ""}
+          {pub.masa_adi} · El {pub.el_no || "—"}/{pub.el_hedef} · {esli ? "Eşli" : "Tekli"}{pub.katlamali ? " · Katlamalı" : ""}
         </span>
         {pub.son_olay && (
           <span className="ustbar__olay">
@@ -405,14 +417,24 @@ export default function MasaPage() {
             </ul>
             <div className="ayar-grup">
               <button disabled={!adminim} className={`ayar-btn ${!esli ? "ayar-btn--aktif" : ""}`}
-                onClick={() => api("ayar", { mod: "tekli", katlamali: pub.katlamali })}>Tekli</button>
+                onClick={() => api("ayar", { mod: "tekli", katlamali: pub.katlamali, elHedef: pub.el_hedef })}>Tekli</button>
               <button disabled={!adminim} className={`ayar-btn ${esli ? "ayar-btn--aktif" : ""}`}
-                onClick={() => api("ayar", { mod: "esli", katlamali: pub.katlamali })}>Eşli</button>
+                onClick={() => api("ayar", { mod: "esli", katlamali: pub.katlamali, elHedef: pub.el_hedef })}>Eşli</button>
               <span className="ayar-ayrac" />
               <button disabled={!adminim} className={`ayar-btn ${!pub.katlamali ? "ayar-btn--aktif" : ""}`}
-                onClick={() => api("ayar", { mod: pub.mod, katlamali: false })}>Katlamasız</button>
+                onClick={() => api("ayar", { mod: pub.mod, katlamali: false, elHedef: pub.el_hedef })}>Katlamasız</button>
               <button disabled={!adminim} className={`ayar-btn ${pub.katlamali ? "ayar-btn--aktif" : ""}`}
-                onClick={() => api("ayar", { mod: pub.mod, katlamali: true })}>Katlamalı</button>
+                onClick={() => api("ayar", { mod: pub.mod, katlamali: true, elHedef: pub.el_hedef })}>Katlamalı</button>
+            </div>
+            <div className="ayar-grup">
+              <span className="ayar-etiket">El sayısı:</span>
+              {[1, 3, 5, 7, 9, 11].map((n) => (
+                <button key={n} disabled={!adminim}
+                  className={`ayar-btn ${pub.el_hedef === n ? "ayar-btn--aktif" : ""}`}
+                  onClick={() => api("ayar", { mod: pub.mod, katlamali: pub.katlamali, elHedef: n })}>
+                  {n}
+                </button>
+              ))}
             </div>
 
             {adminim && (
@@ -481,6 +503,37 @@ export default function MasaPage() {
             )}
           </div>
         )}
+
+        {pub.faz === "oyun_sonu" && (() => {
+          const siralama = esli
+            ? [
+                { ad: "Takım A", skor: (pub.skorlar[0] ?? 0) + (pub.skorlar[2] ?? 0) },
+                { ad: "Takım B", skor: (pub.skorlar[1] ?? 0) + (pub.skorlar[3] ?? 0) },
+              ].sort((a, b) => a.skor - b.skor)
+            : pub.oyuncular
+                .map((o) => ({ ad: o.ad, skor: pub.skorlar[o.koltuk] ?? 0 }))
+                .sort((a, b) => a.skor - b.skor);
+          return (
+            <div className="panel">
+              <h2>🏆 Oyun Bitti</h2>
+              <p className="panel__takim">
+                Kazanan: <b>{siralama[0]?.ad}</b>
+              </p>
+              <ul className="panel__liste">
+                {siralama.map((x, i) => (
+                  <li key={x.ad}>
+                    {i + 1}. {x.ad} — {x.skor} ceza{i === 0 ? " 🥇" : ""}
+                  </li>
+                ))}
+              </ul>
+              {adminim ? (
+                <button className="btn btn--buyuk" onClick={() => api("yenioyun")}>Yeni Oyun</button>
+              ) : (
+                <p className="panel__not">Admin yeni oyun başlatabilir</p>
+              )}
+            </div>
+          );
+        })()}
 
         {pub.faz === "oyun" && (
           <>
